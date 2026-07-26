@@ -1,0 +1,20 @@
+{
+  "name": "discord-bot",
+  "version": "1.0.0",
+  "description": "Discord AI bot — DM-only with threads, multi-provider support",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --import tsx src/index.ts",
+    "dev": "node --watch --import tsx src/index.ts"
+  },
+  "keywords": [],
+  "dependencies": {
+    "@types/node": "^26.1.1",
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.4.2",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  }
+}

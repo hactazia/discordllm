@@ -1,0 +1,12 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "init-project",
+			"type": "shell",
+			"command": "cd /home/hactazia/Documents/discord-bot && npm init -y && npm install discord.js typescript tsx @types/node dotenv && npx tsc --init --outDir dist --rootDir src --module NodeNext --moduleResolution NodeNext --target ES2022 --strict true --esModuleInterop true --resolveJsonModule true --declaration true --sourceMap true",
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
