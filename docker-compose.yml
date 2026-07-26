@@ -1,7 +1,7 @@
 services:
-  discord-bot:
+  discordllm:
     build: .
-    container_name: discord-bot
+    container_name: discordllm
     restart: unless-stopped
     env_file:
       - .env

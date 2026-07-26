@@ -1,5 +1,5 @@
 {
-  "name": "discord-bot",
+  "name": "discordllm",
   "version": "1.0.0",
   "description": "Discord AI bot — DM-only with threads, multi-provider support",
   "main": "dist/index.js",
