@@ -1,0 +1,8 @@
+# Copy this file as docker-compose.yml to use the pre-built GHCR image
+services:
+  discordllm:
+    image: ghcr.io/hactazia/discordllm:latest
+    container_name: discordllm
+    restart: unless-stopped
+    env_file:
+      - .env

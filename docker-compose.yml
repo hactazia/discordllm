@@ -5,3 +5,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+
+  # Example using pre-built GHCR image (uncomment and comment the build above):
+  # discordllm:
+  #   image: ghcr.io/hactazia/discordllm:latest
+  #   container_name: discordllm
+  #   restart: unless-stopped
+  #   env_file:
+  #     - .env
