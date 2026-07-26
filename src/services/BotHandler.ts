@@ -49,7 +49,21 @@ export class BotHandler {
         content = content.slice(1).trimStart();
       }
     }
-    return { role, content: content || "(empty)" };
+
+    // Collect image attachments as base64 URLs
+    const images: string[] = [];
+    if (msg.attachments.size > 0) {
+      for (const [, att] of msg.attachments) {
+        if (att.contentType?.startsWith("image/")) {
+          images.push(att.url);
+        }
+        if (!content) {
+          content = `[Attachment: ${att.name || att.url}]`;
+        }
+      }
+    }
+
+    return { role, content: content || "(empty)", images: images.length > 0 ? images : undefined };
   }
 
   /// Build full conversation history from a DM channel.
@@ -89,6 +103,7 @@ export class BotHandler {
   }
 
   /// Handle a DM message: build history, respond directly in the DM.
+  /// Caller should have already called channel.sendTyping() before this for instant feedback.
   async handleDM(message: DiscordMessage): Promise<void> {
     if (message.author.bot) return;
     const channel = message.channel as DMChannel;
@@ -96,9 +111,6 @@ export class BotHandler {
 
     // Cancel any previous ongoing request in this DM
     this.cancelRequest(channelId);
-
-    // Show typing indicator
-    await channel.sendTyping();
 
     // Build dynamic context with user info
     const now = new Date();
@@ -145,6 +157,16 @@ export class BotHandler {
         messages: history,
         signal: controller.signal,
       });
+
+      // If the model provided reasoning/thinking, show it in a spoiler
+      if (response.reasoning && response.reasoning.trim()) {
+        const thinkingChunks = this.splitMessage(
+          `🧠 **Thinking:**\n||${response.reasoning.slice(0, 1800)}||`
+        );
+        for (const chunk of thinkingChunks) {
+          await channel.send(chunk);
+        }
+      }
 
       const chunks = this.splitMessage(response.content);
       for (const chunk of chunks) {

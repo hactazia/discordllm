@@ -1,6 +1,8 @@
 export interface Message {
   role: "system" | "user" | "assistant";
   content: string;
+  /** Base64-encoded images or URLs for vision models */
+  images?: string[];
 }
 
 export interface CompletionRequest {
@@ -12,6 +14,8 @@ export interface CompletionRequest {
 export interface CompletionResponse {
   content: string;
   model: string;
+  /** Thinking/reasoning chain-of-thought from the model, if supported */
+  reasoning?: string;
 }
 
 export interface ModelInfo {

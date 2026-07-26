@@ -34,11 +34,12 @@ export class DeepSeekProvider implements IApiProvider {
     });
     if (!res.ok) throw new Error(`DeepSeek error: ${res.statusText}`);
     const data = (await res.json()) as {
-      choices: { message: { content: string } }[];
+      choices: { message: { content: string; reasoning_content?: string } }[];
       model: string;
     };
     return {
       content: data.choices[0].message.content,
+      reasoning: data.choices[0].message.reasoning_content,
       model: data.model || request.model,
     };
   }

@@ -148,6 +148,8 @@ export async function main() {
     if (message.author.bot) return;
     if (message.channel.type === ChannelType.DM) {
       console.log(`[DM] Message from ${message.author.tag}: "${message.content.slice(0, 50)}"`);
+      // Fire typing indicator IMMEDIATELY, before any async work
+      message.channel.sendTyping().catch(() => {});
       await handler.handleDM(message);
     }
   });
