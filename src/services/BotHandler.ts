@@ -33,7 +33,7 @@ export class BotHandler {
     this.model = model;
   }
 
-  private discordToApiMessage(msg: DiscordMessage): Message {
+  private async discordToApiMessage(msg: DiscordMessage): Promise<Message> {
     let content = msg.content || "";
     if (msg.embeds.length > 0) {
       for (const embed of msg.embeds) {
@@ -50,20 +50,80 @@ export class BotHandler {
       }
     }
 
-    // Collect image attachments as base64 URLs
+    // Collect image attachments and text files for context
     const images: string[] = [];
+    const textContents: string[] = [];
     if (msg.attachments.size > 0) {
       for (const [, att] of msg.attachments) {
         if (att.contentType?.startsWith("image/")) {
           images.push(att.url);
-        }
-        if (!content) {
-          content = `[Attachment: ${att.name || att.url}]`;
+          if (!content) content = `[Image: ${att.name || "image"}]`;
+        } else if (this.isTextAttachment(att)) {
+          // Always note the attachment, then try to fetch content
+          let fetched = false;
+          try {
+            const res = await fetch(att.url, {
+              headers: {
+                "User-Agent": "DiscordBot (https://discord.com, 14)",
+              },
+            });
+            if (res.ok) {
+              const text = await res.text();
+              textContents.push(
+                `[File: ${att.name}]\n\`\`\`\n${text.slice(0, 4000)}\n\`\`\``
+              );
+              fetched = true;
+            } else {
+              console.log(`[ATTACH] Failed to fetch ${att.name}: HTTP ${res.status}`);
+            }
+          } catch (err) {
+            console.log(`[ATTACH] Error fetching ${att.name}:`, err);
+          }
+          if (!fetched) {
+            textContents.push(`[File attached: ${att.name} — could not fetch content]`);
+          }
+          if (!content) content = `[Attached file: ${att.name}]`;
+        } else {
+          // Unknown attachment type
+          if (!content) content = `[Attachment: ${att.name || att.url}]`;
         }
       }
     }
 
+    // Append text file contents to the message content
+    if (textContents.length > 0) {
+      content = content + "\n\n" + textContents.join("\n\n");
+    }
+
     return { role, content: content || "(empty)", images: images.length > 0 ? images : undefined };
+  }
+
+  /// Check if an attachment is a readable text file
+  private isTextAttachment(att: { contentType?: string | null; name: string }): boolean {
+    const textTypes = [
+      "text/", "application/json", "application/xml", "application/javascript",
+      "application/typescript", "application/x-sh", "application/x-python",
+      "application/x-yaml", "application/x-toml",
+    ];
+    const textExts = [
+      ".txt", ".md", ".json", ".xml", ".yml", ".yaml", ".toml", ".ini", ".cfg",
+      ".js", ".ts", ".jsx", ".tsx", ".py", ".rb", ".rs", ".go", ".java", ".kt",
+      ".c", ".cpp", ".h", ".hpp", ".cs", ".sh", ".bash", ".zsh", ".fish",
+      ".css", ".scss", ".less", ".html", ".htm", ".vue", ".svelte",
+      ".sql", ".graphql", ".env", ".gitignore", ".dockerfile", "dockerfile",
+      ".log", ".csv", ".tsv", ".diff", ".patch",
+    ];
+
+    if (att.contentType) {
+      for (const t of textTypes) {
+        if (att.contentType.startsWith(t)) return true;
+      }
+    }
+    const lower = att.name.toLowerCase();
+    for (const ext of textExts) {
+      if (lower.endsWith(ext)) return true;
+    }
+    return false;
   }
 
   /// Build full conversation history from a DM channel.
@@ -99,10 +159,30 @@ export class BotHandler {
 
     // Reverse to chronological order before converting
     rawMessages.reverse();
-    return rawMessages.map((m) => this.discordToApiMessage(m));
+    return Promise.all(rawMessages.map((m) => this.discordToApiMessage(m)));
+  }
+
+  /// Close unclosed code blocks/inline code for safe streaming display in Discord
+  private sanitizeForStreaming(text: string): string {
+    // Count backtick triples (```) — if odd, append closing ```
+    const tripleCount = (text.match(/```/g) || []).length;
+    if (tripleCount % 2 !== 0) {
+      return text + "\n```";
+    }
+
+    // Count inline backticks (single `, but not part of ```)
+    // Remove all triple backticks, then count singles
+    const withoutTriples = text.replace(/```/g, "");
+    const singleCount = (withoutTriples.match(/`/g) || []).length;
+    if (singleCount % 2 !== 0) {
+      return text + "`";
+    }
+
+    return text;
   }
 
   /// Handle a DM message: build history, respond directly in the DM.
+  /// Uses streaming + message editing for a typewriter effect.
   /// Caller should have already called channel.sendTyping() before this for instant feedback.
   async handleDM(message: DiscordMessage): Promise<void> {
     if (message.author.bot) return;
@@ -142,7 +222,6 @@ export class BotHandler {
     const dmHistory = await this.buildHistory(channel);
     history.push(...dmHistory);
 
-    // Debug: log what's sent to the LLM
     console.log(`[LLM] Sending ${history.length} messages to ${this.provider.name}/${this.model}:`);
     for (const m of history) {
       console.log(`  [${m.role}] ${m.content.slice(0, 80)}${m.content.length > 80 ? "..." : ""}`);
@@ -151,30 +230,122 @@ export class BotHandler {
     const controller = new AbortController();
     this.abortControllers.set(channelId, controller);
 
-    try {
-      const response = await this.provider.complete({
-        model: this.model,
-        messages: history,
-        signal: controller.signal,
-      });
+    // Send initial "thinking" placeholder message
+    const statusMsg = await channel.send("💭 *Réflexion...*");
 
-      // If the model provided reasoning/thinking, show it in a spoiler
-      if (response.reasoning && response.reasoning.trim()) {
-        const thinkingChunks = this.splitMessage(
-          `🧠 **Thinking:**\n||${response.reasoning.slice(0, 1800)}||`
-        );
-        for (const chunk of thinkingChunks) {
-          await channel.send(chunk);
+    try {
+      let fullContent = "";
+      let fullReasoning = "";
+      let currentMsg = statusMsg;
+      // Discord edit rate limit: 5 edits per 5 seconds per channel. Use 1.2s to be safe.
+      const EDIT_INTERVAL = 1200;
+      let lastEdit = 0;
+      let editQueue = Promise.resolve();
+
+      const editMessage = async (content: string): Promise<void> => {
+        editQueue = editQueue.then(async () => {
+          const sanitized = this.sanitizeForStreaming(content);
+          const prefix = fullReasoning ? "🧠 *Réflexion terminée*\n" : "";
+          const display = prefix + (sanitized || "...");
+
+          // Wait for rate limit window
+          const elapsed = Date.now() - lastEdit;
+          if (elapsed < EDIT_INTERVAL && lastEdit > 0) {
+            await new Promise((r) => setTimeout(r, EDIT_INTERVAL - elapsed));
+          }
+
+          try {
+            if (currentMsg === statusMsg) {
+              // First content: send a new message (don't edit the placeholder)
+              currentMsg = await channel.send(display);
+            } else {
+              currentMsg = await currentMsg.edit(display);
+            }
+            lastEdit = Date.now();
+          } catch (err: unknown) {
+            const e = err as { status?: number; code?: number; retryAfter?: number };
+            // Rate limited — wait and retry once
+            if (e.status === 429 || e.code === 429) {
+              const wait = (e.retryAfter ?? 2) * 1000;
+              await new Promise((r) => setTimeout(r, wait));
+              try {
+                if (currentMsg === statusMsg) {
+                  currentMsg = await channel.send(display);
+                } else {
+                  currentMsg = await currentMsg.edit(display);
+                }
+                lastEdit = Date.now();
+              } catch {
+                // give up
+              }
+            }
+          }
+        });
+        await editQueue;
+      };
+
+      // Periodically flush accumulated content to Discord (respect rate limits)
+      let lastFlushedLength = 0;
+      const flushTimer = setInterval(() => {
+        if (fullContent.length > lastFlushedLength) {
+          lastFlushedLength = fullContent.length;
+          editMessage(fullContent);
+        }
+      }, EDIT_INTERVAL);
+
+      const result = await this.provider.completeStream(
+        {
+          model: this.model,
+          messages: history,
+          signal: controller.signal,
+        },
+        // onChunk: called for each text delta — accumulate silently
+        async (_chunk: string) => {
+          fullContent += _chunk;
+        },
+        // onReasoning: called for thinking tokens
+        async (r: string) => {
+          fullReasoning += r;
+          const short = fullReasoning.slice(-80).replace(/\n/g, " ");
+          try {
+            await statusMsg.edit(`🧠 *Réflexion...* ${short}`);
+          } catch {
+            // ignore
+          }
+        },
+      );
+
+      clearInterval(flushTimer);
+      // Flush final content
+      await editMessage(fullContent);
+
+      // Final message: use raw content (properly closed by the LLM), not sanitized
+      if (currentMsg === statusMsg) {
+        await statusMsg.edit("✅ Done (no content)");
+      } else {
+        const prefix = fullReasoning ? "🧠 *Réflexion terminée*\n" : "";
+        try {
+          await currentMsg.edit(prefix + fullContent);
+        } catch {
+          await channel.send(prefix + fullContent);
         }
       }
 
-      const chunks = this.splitMessage(response.content);
-      for (const chunk of chunks) {
-        await channel.send(chunk);
+      // If the response is long, delete streamed message and re-send as split chunks
+      if (fullContent.length > 1900) {
+        try { await currentMsg.delete(); } catch { /* ignore */ }
+        const chunks = this.splitMessage(fullContent);
+        for (const c of chunks) {
+          await channel.send(c);
+        }
       }
     } catch (err: unknown) {
       const error = err as Error & { name?: string };
-      if (error.name === "AbortError") return;
+      if (error.name === "AbortError") {
+        // User cancelled — delete the placeholder if still there
+        try { await statusMsg.delete(); } catch { /* ignore */ }
+        return;
+      }
       await channel.send(`❌ **Error:** ${error.message}`).catch(() => {});
     } finally {
       this.abortControllers.delete(channelId);
@@ -217,15 +388,43 @@ export class BotHandler {
     }
   }
 
+  /// Split a long message into Discord-compatible chunks (<=2000 chars).
+  /// Preserves code blocks: if a split happens inside a ``` block, closes
+  /// it at the end of the first chunk and reopens it (with original language tag)
+  /// at the start of the next.
   private splitMessage(content: string, maxLen = 2000): string[] {
+    const CODE_MARKER = "```";
+    const OVERHEAD = 15; // safety margin for closing/opening markers + lang tag
     const chunks: string[] = [];
     let remaining = content;
+
     while (remaining.length > maxLen) {
-      let splitAt = remaining.lastIndexOf("\n", maxLen);
-      if (splitAt <= 0) splitAt = maxLen;
-      chunks.push(remaining.slice(0, splitAt));
+      const effectiveMax = maxLen - OVERHEAD;
+      let splitAt = remaining.lastIndexOf("\n", effectiveMax);
+      if (splitAt <= 0) splitAt = effectiveMax;
+
+      let firstPart = remaining.slice(0, splitAt);
       remaining = remaining.slice(splitAt);
+
+      // Count ``` occurrences in firstPart — if odd, we're inside a code block
+      const openCount = (firstPart.match(/```/g) || []).length;
+      const isInsideCodeBlock = openCount % 2 !== 0;
+
+      if (isInsideCodeBlock) {
+        // Find the language tag from the opening ``` (e.g., "python" from ```python)
+        const lastOpen = firstPart.lastIndexOf(CODE_MARKER);
+        const afterMarker = firstPart.slice(lastOpen + 3);
+        const langTag = afterMarker.match(/^(\S*)/)?.[1] ?? "";
+
+        // Close the code block at end of first chunk
+        firstPart += "\n" + CODE_MARKER;
+        // Reopen with same language tag at start of next chunk
+        remaining = CODE_MARKER + langTag + remaining;
+      }
+
+      chunks.push(firstPart);
     }
+
     if (remaining) chunks.push(remaining);
     return chunks;
   }

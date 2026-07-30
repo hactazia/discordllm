@@ -8,14 +8,12 @@ import {
   SlashCommandBuilder,
   REST,
   Routes,
-  ChatInputCommandInteraction,
   Interaction,
-  ActionRowBuilder,
-  StringSelectMenuBuilder,
-  StringSelectMenuInteraction,
+  ChatInputCommandInteraction,
   Partials,
 } from "discord.js";
 import { BotHandler } from "./services/BotHandler.js";
+import { loadCache, saveCache } from "./services/cache.js";
 import { type IApiProvider, OpenAIProvider, AnthropicProvider, DeepSeekProvider } from "./providers/index.js";
 
 interface ProviderEntry {
@@ -47,7 +45,38 @@ export async function main() {
     process.exit(1);
   }
 
+  // Parse allowed users from env + cache
+  const envAllowed = (process.env.ALLOWED_USERS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
   const defaultProvider = providers[0];
+
+  // Try to restore last used model and allowed users from cache
+  const cached = loadCache();
+  let activeProvider = defaultProvider;
+  let activeModel = defaultProvider.provider.defaultModel;
+  let allowedUsers: Set<string> = new Set(envAllowed);
+
+  if (cached) {
+    const cachedEntry = providers.find((p) => p.key === cached.providerKey);
+    if (cachedEntry) {
+      activeProvider = cachedEntry;
+      activeModel = cached.modelId;
+      console.log(`[CACHE] Restored: ${cachedEntry.provider.name} / ${cached.modelId}`);
+    }
+    for (const id of cached.allowedUsers) {
+      allowedUsers.add(id);
+    }
+  }
+
+  // If whitelist is non-empty, only those users can talk to the bot
+  // If empty (no ALLOWED_USERS and no cached users), everyone can DM
+  const isWhitelisted = (userId: string): boolean => {
+    if (allowedUsers.size === 0) return true;
+    return allowedUsers.has(userId);
+  };
 
   const client = new Client({
     intents: [
@@ -62,12 +91,30 @@ export async function main() {
     ],
   });
 
-  const handler = new BotHandler(client, defaultProvider.provider, defaultProvider.provider.defaultModel, SYSTEM_PROMPT);
+  const handler = new BotHandler(client, activeProvider.provider, activeModel, SYSTEM_PROMPT);
 
   // Register slash commands
   const switchCommand = new SlashCommandBuilder()
     .setName("switch")
-    .setDescription("Switch AI model or provider");
+    .setDescription("Switch AI model or provider")
+    .setDMPermission(true)
+    .addStringOption((option) =>
+      option
+        .setName("model")
+        .setDescription("The model to switch to")
+        .setRequired(true)
+        .setAutocomplete(true),
+    );
+
+  const allowCommand = new SlashCommandBuilder()
+    .setName("allow")
+    .setDescription("Allow a user to talk to the bot in DMs")
+    .addUserOption((option) =>
+      option
+        .setName("user")
+        .setDescription("The user to allow")
+        .setRequired(true),
+    );
 
   const rest = new REST({ version: "10" }).setToken(token);
 
@@ -76,12 +123,40 @@ export async function main() {
 
     try {
       await rest.put(Routes.applicationCommands(readyClient.user.id), {
-        body: [switchCommand.toJSON()],
+        body: [switchCommand.toJSON(), allowCommand.toJSON()],
       });
       console.log("Slash commands registered");
     } catch (err) {
       console.error("Failed to register slash commands:", err);
     }
+  });
+
+  // Handle autocomplete for /switch
+  client.on(Events.InteractionCreate, async (interaction: Interaction) => {
+    if (!interaction.isAutocomplete()) return;
+    if (interaction.commandName !== "switch") return;
+
+    const focused = interaction.options.getFocused();
+    const choices: { name: string; value: string }[] = [];
+
+    for (const { key, provider } of providers) {
+      try {
+        const models = await provider.listModels();
+        for (const model of models) {
+          const label = `${provider.name}: ${model.name} (${model.id})`;
+          if (focused.length === 0 || label.toLowerCase().includes(focused.toLowerCase())) {
+            choices.push({
+              name: label,
+              value: `${key}:${model.id}`,
+            });
+          }
+        }
+      } catch {
+        // skip failed providers
+      }
+    }
+
+    await interaction.respond(choices.slice(0, 25));
   });
 
   // Handle /switch command
@@ -90,63 +165,45 @@ export async function main() {
     const cmd = interaction as ChatInputCommandInteraction;
 
     if (cmd.commandName === "switch") {
-      // Build select menu with all available models
-      const options: { label: string; value: string; description: string }[] = [];
-
-      for (const { key, provider } of providers) {
-        const models = await provider.listModels();
-        for (const model of models) {
-          options.push({
-            label: `${provider.name} - ${model.name}`,
-            value: `${key}:${model.id}`,
-            description: `Switch to ${model.name} from ${provider.name}`,
-          });
-        }
-      }
-
-      if (options.length === 0) {
-        await cmd.reply({ content: "No models available.", ephemeral: true });
-        return;
-      }
-
-      const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-        new StringSelectMenuBuilder()
-          .setCustomId("switch_model")
-          .setPlaceholder("Choose a model...")
-          .addOptions(options.slice(0, 25)), // Discord limit: 25 options
-      );
-
-      await cmd.reply({ content: "**Select an AI model:**", components: [row], ephemeral: true });
-    }
-  });
-
-  // Handle select menu
-  client.on(Events.InteractionCreate, async (interaction: Interaction) => {
-    if (!interaction.isStringSelectMenu()) return;
-    const menu = interaction as StringSelectMenuInteraction;
-
-    if (menu.customId === "switch_model") {
-      const [providerKey, modelId] = menu.values[0].split(":");
+      const value = cmd.options.getString("model", true);
+      const [providerKey, modelId] = value.split(":");
       const entry = providers.find((p) => p.key === providerKey);
+
       if (!entry) {
-        await menu.reply({ content: "Provider not found.", ephemeral: true });
+        await cmd.reply({ content: "❌ Provider not found.", ephemeral: true });
         return;
       }
 
       handler.setProvider(entry.provider);
       handler.setModel(modelId);
+      saveCache(providerKey, modelId, [...allowedUsers]);
 
-      await menu.reply({
+      await cmd.reply({
         content: `✅ Switched to **${entry.provider.name}** — model \`${modelId}\``,
+        ephemeral: true,
+      });
+    }
+
+    if (cmd.commandName === "allow") {
+      const user = cmd.options.getUser("user", true);
+      allowedUsers.add(user.id);
+      saveCache(activeProvider.key, activeModel, [...allowedUsers]);
+
+      await cmd.reply({
+        content: `✅ **${user.tag}** (${user.id}) can now DM the bot.`,
         ephemeral: true,
       });
     }
   });
 
-  // DM: build history and respond directly
+  // DM: build history and respond directly (whitelist check)
   client.on(Events.MessageCreate, async (message: Message) => {
     if (message.author.bot) return;
     if (message.channel.type === ChannelType.DM) {
+      if (!isWhitelisted(message.author.id)) {
+        console.log(`[DM] Blocked ${message.author.tag} — not whitelisted`);
+        return;
+      }
       console.log(`[DM] Message from ${message.author.tag}: "${message.content.slice(0, 50)}"`);
       // Fire typing indicator IMMEDIATELY, before any async work
       message.channel.sendTyping().catch(() => {});
